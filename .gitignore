@@ -1,2 +1,4 @@
 .DS_Store
 data/
+dcms/
+__pycache__/
