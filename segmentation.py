@@ -9,12 +9,11 @@ import matplotlib.pyplot as plt
 import json
 import ast
 import sys
-import cv2
 
 FLAGGED = []
 NOT_FOUND = 1010101
 
-with open('../hem_seg_labels/flagged.txt', 'r') as f:
+with open('hem_seg_labels/flagged.txt', 'r') as f:
     for id in f.readlines():
         FLAGGED.append(id.strip())
 
@@ -28,7 +27,7 @@ with open('../hem_seg_labels/flagged.txt', 'r') as f:
 # subarachnoid -> brain, max_contrast, brain_bone, subdural
 # subdural -> subdural, brain, max_contrast, brain_bone
 EPIDURAL = INTRAPARENCHYMAL = INTRAVENTRICULAR = MULTI = SUBARACHNOID = ["brain_window", "max_contrast_window", "brain_bone_window", "subdural_window"]
-SUBDURAL = ["subdural_window", "brain_window", "max_contrast_window", "brain_bone_window"]
+SUBDURAL = OTHER = ["brain_window", "subdural_window","max_contrast_window", "brain_bone_window"]
 
 # goal:
 # read through each csv of segmentation info
@@ -45,9 +44,12 @@ def generate_pixel_mask(dim, pixels):
     1s represent the border of the polygon determined by pixels, where pixels is
     [{'x': float, 'y': float}, ...]
     """
-    mask = np.ones((dim, dim), dtype=int)
+    mask = np.full((dim, dim), 2, dtype=int)
     vertices = []
-    pixels = ast.literal_eval(pixels)
+    try:
+        pixels = ast.literal_eval(pixels)
+    except ValueError:
+        return NOT_FOUND
 
     if len(pixels) == 1:
         if pixels[0]:
@@ -83,19 +85,21 @@ def fill_polygon(array):
     filled_array = array.copy()
 
     # Find the leftmost and rightmost points of the polygon
-    min_x = np.min(np.where(array == 0)[0])
-    max_x = np.max(np.where(array == 0)[0])
+    min_x = np.min(np.where(array == 1)[0])
+    max_x = np.max(np.where(array == 1)[0])
 
     # Iterate through each row of the array
     for i in range(min_x, max_x + 1):
         row = array[i]
 
         # Find the leftmost and rightmost points of the polygon in this row
-        leftmost = np.min(np.where(row == 0)[0])
-        rightmost = np.max(np.where(row == 0)[0])
+        leftmost = np.min(np.where(row == 1)[0])
+        rightmost = np.max(np.where(row == 1)[0])
 
         # Fill the pixels between the leftmost and rightmost points
-        filled_array[i, leftmost:rightmost + 1] = 0
+        filled_array[i, leftmost-3:leftmost] = 1
+        filled_array[i, rightmost+2:rightmost+4] = 1
+        filled_array[i, leftmost:rightmost+2] = 0
 
     return filled_array
 
@@ -110,7 +114,7 @@ def draw_line(matrix, x0, y0, x1, y1):
 
     while x0 != x1 or y0 != y1:
         # Set the pixel value to 1 (draw the edge)
-        matrix[y0][x0] = 0
+        matrix[y0][x0] = 1
         e2 = 2 * err
         if e2 > -dy:
             err -= dy
@@ -135,9 +139,8 @@ def load_image(id, type, pref, mask_pixels):
     """
     for window in pref:
         try:
-            img = Image.open(f"../dcms/{type}/{window}/{id}")
+            img = Image.open(f"dcms/{type}/{window}/{id}")
             img = img.resize((128, 128))
-
             img = tf.cast(img, tf.float32) / 255.0
             
             mask = generate_pixel_mask(128, mask_pixels)
@@ -147,6 +150,7 @@ def load_image(id, type, pref, mask_pixels):
 
             # mask_img = np.array((255 * (1-mask)).astype(np.uint8))
             mask_img = tf.expand_dims(mask, axis=-1)
+            # mask_img = tf.cast(mask_img, tf.uint8)
             # mask_img = tf.concat([mask_img] * 3, axis = -1)
             
             return img, mask_img
@@ -182,16 +186,15 @@ def read_segmentation_labels(path):
     subset_df.drop(drops, inplace=True)
     subset_df.drop(['Majority Label', 'Correct Label'], axis=1, inplace=True)
 
-
     return subset_df
 
  
-paths = ['../hem_seg_labels/epidural_segments.csv', '../hem_seg_labels/intraparenchymal_segments.csv', '../hem_seg_labels/multi_segments.csv', '../hem_seg_labels/subarachnoid_segments.csv', '../hem_seg_labels/subdural_segments.csv']
+paths = ['hem_seg_labels/epidural_segments.csv', 'hem_seg_labels/intraparenchymal_segments.csv', 'hem_seg_labels/multi_segments.csv', 'hem_seg_labels/subarachnoid_segments.csv', 'hem_seg_labels/subdural_segments.csv', 'hem_seg_labels/other_segments.csv']
 
 # order: epidural, intrap, intrav (NO LABEL DATA), multi, subarach, subdural
 labels = [read_segmentation_labels(path) for path in paths]
-label_prefs = [EPIDURAL, INTRAPARENCHYMAL, MULTI, SUBARACHNOID, SUBDURAL]
-types = ["epidural", "intraparenchymal", "multi", "subarachnoid", "subdural"]
+label_prefs = [EPIDURAL, INTRAPARENCHYMAL, MULTI, SUBARACHNOID, SUBDURAL, OTHER]
+types = ["epidural", "intraparenchymal", "multi", "subarachnoid", "subdural", "intraventricular"]
 
 x_train = []
 y_train = []
@@ -208,7 +211,7 @@ for label_df, pref, type in zip(labels, label_prefs, types):
                 img, mask = load_image(row['Origin'], type, pref, row['Label'])
                 x_train.append(img)
                 y_train.append(mask)
-            except TypeError:
+            except (TypeError, FileNotFoundError):
                 continue
     # Test Data        
     for index, row in label_df.iloc[num_rows:].iterrows():
@@ -217,11 +220,23 @@ for label_df, pref, type in zip(labels, label_prefs, types):
                 img, mask = load_image(row['Origin'], type, pref, row['Label'])
                 x_test_raw.append(img)
                 y_test_raw.append(mask)
-            except TypeError:
+            except (TypeError, FileNotFoundError):
                 continue
 
+class Augment(tf.keras.layers.Layer):
+    def __init__(self, seed=42):
+        super().__init__()
+        self.augment_inputs = tf.keras.layers.RandomFlip(mode="horizontal", seed=seed)
+        self.augment_labels = tf.keras.layers.RandomFlip(mode="horizontal", seed=seed)
+
+    def call(self, inputs, labels):
+        inputs = self.augment_inputs(inputs)
+        labels = self.augment_labels(labels)
+        return inputs, labels
+
 TRAIN_LENGTH = len(x_train)
-BATCH_SIZE = 75
+print(TRAIN_LENGTH)
+BATCH_SIZE = 64
 STEPS_PER_EPOCH = TRAIN_LENGTH // BATCH_SIZE
 
 x_train = tf.data.Dataset.from_tensor_slices(x_train)
@@ -231,17 +246,10 @@ y_train = tf.data.Dataset.from_tensor_slices(y_train)
 y_test = tf.data.Dataset.from_tensor_slices(y_test_raw)
 
 train_data = tf.data.Dataset.zip((x_train, y_train))
-train_data = train_data.shuffle(buffer_size = len(x_train))
-train_data = train_data.batch(BATCH_SIZE)
+train_data = (train_data.shuffle(buffer_size = len(x_train)).batch(BATCH_SIZE).repeat().map(Augment()))
 
 test_data = tf.data.Dataset.zip((x_test, y_test))
-test_data = test_data.shuffle(buffer_size = len(x_test))
-test_data = test_data.batch(BATCH_SIZE)
-
-# BUFFER_SIZE = len(test_data)
-# test_data = tf.data.Dataset.from_tensor_slices(test_data)
-# test_data = test_data.shuffle(buffer_size=BUFFER_SIZE)
-# test_data = test_data.batch(BATCH_SIZE)
+test_data = (test_data.shuffle(buffer_size = len(x_test)).batch(32).repeat().map(Augment()))
 
 print("Preprocessing and batching done")
 
@@ -293,7 +301,7 @@ def unet_model(output_channels):
     return tf.keras.Model(inputs=inputs, outputs=x)
 
 
-OUTPUT_CLASSES = 2
+OUTPUT_CLASSES = 3
 
 model = unet_model(OUTPUT_CLASSES)
 model.compile(optimizer='adam', loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),metrics=['accuracy'])
@@ -301,31 +309,32 @@ model.compile(optimizer='adam', loss=tf.keras.losses.SparseCategoricalCrossentro
 print("Model is compiled, moving to training")
 
 # TRAINING
-EPOCHS = 8
+EPOCHS = 20
 
-STEPS_PER_EPOCH = TRAIN_LENGTH // BATCH_SIZE // EPOCHS
+STEPS_PER_EPOCH = TRAIN_LENGTH // BATCH_SIZE
+VALIDATION_STEPS = len(x_test_raw) // 32 // 3
 
-history = model.fit(train_data, batch_size = BATCH_SIZE,  epochs=EPOCHS, steps_per_epoch=STEPS_PER_EPOCH, verbose=1,  validation_data=test_data)
+history = model.fit(train_data,  epochs=EPOCHS, steps_per_epoch=STEPS_PER_EPOCH, verbose=1, validation_steps=VALIDATION_STEPS, validation_data=test_data)
 
 model.save('hemorrhage_segmentation')
 
 
 print("Test input:")
-test_img = x_test_raw[0]
-true_mask = y_test_raw[0]
+test_img = x_test_raw[130]
+true_mask = y_test_raw[130]
 
 test_input = tf.expand_dims(test_img, axis=0)
 
 pred_mask = model.predict(test_input)
 
-pred_mask_new = []
-for i in range(len(pred_mask)):
-    pred_mask_new.append([])
-    for j in range(len(pred_mask[i])):
-        if pred_mask[i][j][1][0] + pred_mask[i][j][0][0] < 3.0:
-            pred_mask_new.append([255])
-        else:
-            pred_mask_new.append([0])
+# pred_mask_new = []
+# for i in range(len(pred_mask)):
+#     pred_mask_new.append([])
+#     for j in range(len(pred_mask[i])):
+#         if pred_mask[i][j][1][0] + pred_mask[i][j][0][0] < 3.0:
+#             pred_mask_new[i].append([255])
+#         else:
+#             pred_mask_new[i].append([0])
 
 pred_mask = tf.math.argmax(pred_mask, axis=-1)
 
@@ -348,7 +357,7 @@ plt.axis('off')
 
 plt.subplot(1, 3, 3)
 plt.title(title[2])
-plt.imshow(tf.keras.utils.array_to_img(pred_mask_new))
+plt.imshow(tf.keras.utils.array_to_img(pred_mask))
 plt.axis('off')
 
 
