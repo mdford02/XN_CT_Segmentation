@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import json
 import ast
 import sys
+import cv2
 
 FLAGGED = []
 NOT_FOUND = 1010101
@@ -71,8 +72,32 @@ def generate_pixel_mask(dim, pixels):
     # Add bresenham's?
     draw_polygon(mask, vertices)
 
+    mask = fill_polygon(mask)
 
     return mask
+
+def fill_polygon(array):
+    """
+    Fill the inside of a polygon represented by 0s in a binary array with 0s.
+    """
+    filled_array = array.copy()
+
+    # Find the leftmost and rightmost points of the polygon
+    min_x = np.min(np.where(array == 0)[0])
+    max_x = np.max(np.where(array == 0)[0])
+
+    # Iterate through each row of the array
+    for i in range(min_x, max_x + 1):
+        row = array[i]
+
+        # Find the leftmost and rightmost points of the polygon in this row
+        leftmost = np.min(np.where(row == 0)[0])
+        rightmost = np.max(np.where(row == 0)[0])
+
+        # Fill the pixels between the leftmost and rightmost points
+        filled_array[i, leftmost:rightmost + 1] = 0
+
+    return filled_array
 
 
 # Bresenham's impl.
@@ -123,7 +148,6 @@ def load_image(id, type, pref, mask_pixels):
             # mask_img = np.array((255 * (1-mask)).astype(np.uint8))
             mask_img = tf.expand_dims(mask, axis=-1)
             # mask_img = tf.concat([mask_img] * 3, axis = -1)
-            mask_img = tf.cast(mask_img, tf.float32)
             
             return img, mask_img
             
@@ -172,8 +196,8 @@ types = ["epidural", "intraparenchymal", "multi", "subarachnoid", "subdural"]
 x_train = []
 y_train = []
 
-x_test = []
-y_test = []
+x_test_raw = []
+y_test_raw = []
 
 for label_df, pref, type in zip(labels, label_prefs, types):
     num_rows = int(len(label_df) * 0.75)
@@ -191,20 +215,20 @@ for label_df, pref, type in zip(labels, label_prefs, types):
         if row['Origin'] not in FLAGGED:
             try:
                 img, mask = load_image(row['Origin'], type, pref, row['Label'])
-                x_test.append(img)
-                y_test.append(mask)
+                x_test_raw.append(img)
+                y_test_raw.append(mask)
             except TypeError:
                 continue
 
 TRAIN_LENGTH = len(x_train)
-BATCH_SIZE = 32
+BATCH_SIZE = 75
 STEPS_PER_EPOCH = TRAIN_LENGTH // BATCH_SIZE
 
 x_train = tf.data.Dataset.from_tensor_slices(x_train)
-x_test = tf.data.Dataset.from_tensor_slices(x_test)
+x_test = tf.data.Dataset.from_tensor_slices(x_test_raw)
 
 y_train = tf.data.Dataset.from_tensor_slices(y_train)
-y_test = tf.data.Dataset.from_tensor_slices(y_test)
+y_test = tf.data.Dataset.from_tensor_slices(y_test_raw)
 
 train_data = tf.data.Dataset.zip((x_train, y_train))
 train_data = train_data.shuffle(buffer_size = len(x_train))
@@ -277,40 +301,75 @@ model.compile(optimizer='adam', loss=tf.keras.losses.SparseCategoricalCrossentro
 print("Model is compiled, moving to training")
 
 # TRAINING
-EPOCHS = 10
+EPOCHS = 8
 
-STEPS_PER_EPOCH = TRAIN_LENGTH // BATCH_SIZE // EPOCHS // 2
+STEPS_PER_EPOCH = TRAIN_LENGTH // BATCH_SIZE // EPOCHS
 
 history = model.fit(train_data, batch_size = BATCH_SIZE,  epochs=EPOCHS, steps_per_epoch=STEPS_PER_EPOCH, verbose=1,  validation_data=test_data)
 
 model.save('hemorrhage_segmentation')
 
 
-#row1 = labels.iloc[0]
+print("Test input:")
+test_img = x_test_raw[0]
+true_mask = y_test_raw[0]
 
-#id = row1['Origin']
-#type = 'epidural'
-#pixels = row1['Label']
+test_input = tf.expand_dims(test_img, axis=0)
 
-#img, mask = load_image(id, type, EPIDURAL, pixels)
+pred_mask = model.predict(test_input)
 
-#plt.figure(figsize=(15, 15))
+pred_mask_new = []
+for i in range(len(pred_mask)):
+    pred_mask_new.append([])
+    for j in range(len(pred_mask[i])):
+        if pred_mask[i][j][1][0] + pred_mask[i][j][0][0] < 3.0:
+            pred_mask_new.append([255])
+        else:
+            pred_mask_new.append([0])
 
-#title = ['Image', 'Mask']
+pred_mask = tf.math.argmax(pred_mask, axis=-1)
 
-#plt.subplot(1, 2, 1)
-#plt.title(title[0])
-#plt.imshow(tf.keras.utils.array_to_img(img))
-#plt.axis('off')
+pred_mask = pred_mask[..., tf.newaxis]
+pred_mask = pred_mask[0]
 
-#plt.subplot(1, 2, 2)
-#plt.title(title[1])
-#plt.imshow(tf.keras.utils.array_to_img(mask))
-#plt.axis('off')
+plt.figure(figsize=(15, 15))
 
-#plt.savefig('image.png')
+title = ['Image', 'True Mask', 'Predicted Mask']
+
+plt.subplot(1, 3, 1)
+plt.title(title[0])
+plt.imshow(tf.keras.utils.array_to_img(test_img))
+plt.axis('off')
+
+plt.subplot(1, 3, 2)
+plt.title(title[1])
+plt.imshow(tf.keras.utils.array_to_img(true_mask))
+plt.axis('off')
+
+plt.subplot(1, 3, 3)
+plt.title(title[2])
+plt.imshow(tf.keras.utils.array_to_img(pred_mask_new))
+plt.axis('off')
 
 
+plt.savefig('model_prediction.png')
+
+
+print("Plotting training history")
+
+loss = history.history['loss']
+val_loss = history.history['val_loss']
+
+plt.figure()
+plt.plot(history.epoch, loss, 'r', label='Training Loss')
+plt.plot(history.epoch, val_loss, 'bo', label='Validation Loss')
+plt.title('Training and Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss Value')
+plt.ylim([0,1])
+plt.legend()
+
+plt.savefig('model_train_val_loss.png')
 
 
 
